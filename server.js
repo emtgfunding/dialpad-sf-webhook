@@ -39,14 +39,13 @@ app.use((req, res, next) => {
 
 // ─── Dialpad Helpers ─────────────────────────────────────────────────────────
 
-const DIALPAD_API_KEY = process.env.DIALPAD_API_KEY;
-
 async function getDialpadUserByEmail(email) {
   if (!email) return null;
+  const apiKey = process.env.DIALPAD_API_KEY;
   try {
     const res = await axios.get(
       `https://dialpad.com/api/v2/users?email=${encodeURIComponent(email)}`,
-      { headers: { Authorization: `Bearer ${DIALPAD_API_KEY}` } }
+      { headers: { Authorization: `Bearer ${apiKey}` } }
     );
     const items = res.data?.items || [];
     return items[0] || null;
@@ -57,11 +56,12 @@ async function getDialpadUserByEmail(email) {
 }
 
 async function fireScreenPop(dialpadUserId, sfLeadUrl) {
+  const apiKey = process.env.DIALPAD_API_KEY;
   try {
     const res = await axios.post(
       `https://dialpad.com/api/v2/screenpop`,
       { user_id: dialpadUserId, url: sfLeadUrl },
-      { headers: { Authorization: `Bearer ${DIALPAD_API_KEY}`, 'Content-Type': 'application/json' } }
+      { headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' } }
     );
     console.log(`[Dialpad] Screen pop fired for user ${dialpadUserId} → ${sfLeadUrl}`);
     return res.data;
