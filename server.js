@@ -106,7 +106,7 @@ async function findBorrowersByPhone(phone10) {
                 OR MobilePhone IN (${phoneVariants})
              ORDER BY CreatedDate DESC
              LIMIT 1`),
-    sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, Status, CreatedDate
+    sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, Status, CreatedDate, OwnerId
              FROM Lead
              WHERE (Phone IN (${phoneVariants})
                 OR MobilePhone IN (${phoneVariants}))
@@ -291,13 +291,17 @@ app.post('/webhook/dialpad', async (req, res) => {
     console.log(`[SF] Lead IDs found: ${externalBorrower.leads.map(l => l.Id).join(', ') || 'none'}`);
     console.log(`[SF] Loan officer SF User: ${sfUser ? sfUser.Name + ' (' + sfUser.Id + ')' : 'NOT FOUND — email: ' + loEmail}`);
 
-    // Reassign only the single most recently created Lead
+    // Only reassign if current owner is the default pool owner
+    const DEFAULT_OWNER_ID = '005Hr00000IS9pcIAD';
     if (sfUser) {
       const primaryLead = externalBorrower.leads[0];
-      if (primaryLead) {
-        await reassignOwner(primaryLead.Id, true, sfUser.Id);
-      } else {
+      if (!primaryLead) {
         console.log(`[SF] No matching Lead found for ${externalPhone}`);
+      } else if (primaryLead.OwnerId !== DEFAULT_OWNER_ID) {
+        console.log(`[SF] Skipping reassignment — Lead ${primaryLead.Id} already owned by ${primaryLead.OwnerId} (not default pool)`);
+      } else {
+        console.log(`[SF] Lead ${primaryLead.Id} is owned by default pool — reassigning to ${sfUser.Name}`);
+        await reassignOwner(primaryLead.Id, true, sfUser.Id);
       }
     } else {
       console.log(`[SF] Skipping reassignment — LO email ${loEmail} not found in SF`);
