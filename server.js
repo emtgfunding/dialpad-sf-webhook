@@ -37,6 +37,39 @@ app.use((req, res, next) => {
   });
 });
 
+// ─── Dialpad Helpers ─────────────────────────────────────────────────────────
+
+const DIALPAD_API_KEY = process.env.DIALPAD_API_KEY;
+
+async function getDialpadUserByEmail(email) {
+  if (!email) return null;
+  try {
+    const res = await axios.get(
+      `https://dialpad.com/api/v2/users?email=${encodeURIComponent(email)}`,
+      { headers: { Authorization: `Bearer ${DIALPAD_API_KEY}` } }
+    );
+    const items = res.data?.items || [];
+    return items[0] || null;
+  } catch (err) {
+    console.error('[Dialpad] User lookup failed:', err.response?.data || err.message);
+    return null;
+  }
+}
+
+async function fireScreenPop(dialpadUserId, sfLeadUrl) {
+  try {
+    const res = await axios.post(
+      `https://dialpad.com/api/v2/screenpop`,
+      { user_id: dialpadUserId, url: sfLeadUrl },
+      { headers: { Authorization: `Bearer ${DIALPAD_API_KEY}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`[Dialpad] Screen pop fired for user ${dialpadUserId} → ${sfLeadUrl}`);
+    return res.data;
+  } catch (err) {
+    console.error('[Dialpad] Screen pop failed:', err.response?.data || err.message);
+  }
+}
+
 // ─── Salesforce Auth ──────────────────────────────────────────────────────────
 
 let sfAccessToken = null;
@@ -317,18 +350,28 @@ app.post('/webhook/dialpad', async (req, res) => {
 
     // Only reassign if current owner is the default pool owner
     const DEFAULT_OWNER_ID = '005Hr00000IS9pcIAD';
-    if (sfUser) {
-      const primaryLead = externalBorrower.leads[0];
-      if (!primaryLead) {
-        console.log(`[SF] No matching Lead found for ${externalPhone}`);
-      } else if (primaryLead.OwnerId !== DEFAULT_OWNER_ID) {
-        console.log(`[SF] Skipping reassignment — Lead ${primaryLead.Id} already owned by ${primaryLead.OwnerId} (not default pool)`);
+    const primaryLead = externalBorrower.leads[0];
+
+    if (sfUser && primaryLead) {
+      if (primaryLead.OwnerId !== DEFAULT_OWNER_ID) {
+        console.log(`[SF] Skipping reassignment — Lead ${primaryLead.Id} already owned by ${primaryLead.OwnerId}`);
       } else {
-        console.log(`[SF] Lead ${primaryLead.Id} is owned by default pool — reassigning to ${sfUser.Name}`);
+        console.log(`[SF] Reassigning Lead ${primaryLead.Id} to ${sfUser.Name}`);
         await reassignOwner(primaryLead.Id, true, sfUser.Id);
       }
+
+      // Fire screen pop — opens the Lead record in the LO's browser via Dialpad
+      const leadUrl = `https://emtg.lightning.force.com/lightning/r/Lead/${primaryLead.Id}/view`;
+      const dialpadUser = await getDialpadUserByEmail(loEmail);
+      if (dialpadUser?.id) {
+        await fireScreenPop(dialpadUser.id, leadUrl);
+      } else {
+        console.log(`[Dialpad] Could not find Dialpad user for ${loEmail} — skipping screen pop`);
+      }
+    } else if (!sfUser) {
+      console.log(`[SF] Skipping — LO email ${loEmail} not found in SF`);
     } else {
-      console.log(`[SF] Skipping reassignment — LO email ${loEmail} not found in SF`);
+      console.log(`[SF] No matching Lead found for ${externalPhone}`);
     }
 
     // Log call activity Task
