@@ -127,8 +127,8 @@ async function findBorrowersByPhone(phone10) {
              LIMIT 1`),
     sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, Status, CreatedDate
              FROM Lead
-             WHERE Phone IN (${phoneVariants})
-                OR MobilePhone IN (${phoneVariants})
+             WHERE (Phone IN (${phoneVariants})
+                OR MobilePhone IN (${phoneVariants}))
              AND IsConverted = false
              ORDER BY CreatedDate DESC
              LIMIT 1`),
@@ -277,9 +277,12 @@ app.post('/webhook/dialpad', async (req, res) => {
   console.log('[Webhook] Decoded payload keys:', Object.keys(payload));
   console.log(`[Webhook] Event: state=${payload.state} call_id=${payload.call_id} dir=${payload.direction}`);
 
-  // Only act on "connected" — this is the "phone picked up" moment
+  // Only act on inbound connected calls — borrower picked up or LO answered inbound
   if (payload.state !== 'connected') {
-    return res.status(200).json({ skipped: true, state: payload.state });
+    return res.status(200).json({ skipped: true, reason: 'not connected', state: payload.state });
+  }
+  if (payload.direction !== 'inbound') {
+    return res.status(200).json({ skipped: true, reason: 'outbound call ignored', call_id: payload.call_id });
   }
 
   const externalPhone = normalizePhone(payload.external_number);
@@ -327,8 +330,9 @@ app.post('/webhook/dialpad', async (req, res) => {
       reassigned: !!sfUser && (externalBorrower.contacts.length + externalBorrower.leads.length) > 0,
     });
   } catch (err) {
-    console.error('[Error]', err.message);
-    return res.status(500).json({ error: err.message });
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error('[Error]', detail);
+    return res.status(500).json({ error: detail });
   }
 });
 
