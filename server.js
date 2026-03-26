@@ -48,8 +48,8 @@ async function getSalesforceToken() {
 
   const params = qs.stringify({
     grant_type: 'password',
-    client_id: process.env.SF_CLIENT_ID,
-    client_secret: process.env.SF_CLIENT_SECRET,
+    client_id: process.env.SF_CLIENT_ID || 'PlatformCLI',
+    client_secret: process.env.SF_CLIENT_SECRET || '',
     username: process.env.SF_USERNAME,
     password: `${process.env.SF_PASSWORD}${process.env.SF_SECURITY_TOKEN || ''}`,
   });
@@ -295,13 +295,15 @@ app.post('/webhook/dialpad', async (req, res) => {
     console.log(`[Webhook] Loan officer email from Dialpad: ${loEmail}`);
 
     // Look up borrower by phone AND loan officer by email concurrently
+    console.log(`[SF] Starting lookup — phone: ${externalPhone}, LO: ${loEmail}`);
     const [externalBorrower, sfUser] = await Promise.all([
       findBorrowersByPhone(externalPhone),
       findSFUserByEmail(loEmail),
     ]);
 
     console.log(`[SF] Borrower matches: ${externalBorrower.contacts.length} contacts, ${externalBorrower.leads.length} leads`);
-    console.log(`[SF] Loan officer SF User: ${sfUser ? sfUser.Name + ' (' + sfUser.Id + ')' : 'NOT FOUND'}`);
+    console.log(`[SF] Lead IDs found: ${externalBorrower.leads.map(l => l.Id).join(', ') || 'none'}`);
+    console.log(`[SF] Loan officer SF User: ${sfUser ? sfUser.Name + ' (' + sfUser.Id + ')' : 'NOT FOUND — email: ' + loEmail}`);
 
     // Reassign only the single most recently created Lead
     if (sfUser) {
