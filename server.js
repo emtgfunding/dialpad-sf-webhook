@@ -17,7 +17,6 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
-const qs = require('querystring');
 
 const app = express();
 
@@ -40,30 +39,12 @@ app.use((req, res, next) => {
 
 // ─── Salesforce Auth ──────────────────────────────────────────────────────────
 
-let sfAccessToken = null;
-let sfInstanceUrl = null;
-
 async function getSalesforceToken() {
-  if (sfAccessToken) return { accessToken: sfAccessToken, instanceUrl: sfInstanceUrl };
-
-  const params = qs.stringify({
-    grant_type: 'password',
-    client_id: process.env.SF_CLIENT_ID || 'PlatformCLI',
-    client_secret: process.env.SF_CLIENT_SECRET || '',
-    username: process.env.SF_USERNAME,
-    password: `${process.env.SF_PASSWORD}${process.env.SF_SECURITY_TOKEN || ''}`,
-  });
-
-  const res = await axios.post(
-    `${process.env.SF_LOGIN_URL}/services/oauth2/token`,
-    params,
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-  );
-
-  sfAccessToken = res.data.access_token;
-  sfInstanceUrl = res.data.instance_url;
-  console.log('[SF] Authenticated. Instance:', sfInstanceUrl);
-  return { accessToken: sfAccessToken, instanceUrl: sfInstanceUrl };
+  // Use static token from env (refreshed via SF CLI when needed)
+  const accessToken = process.env.SF_ACCESS_TOKEN;
+  const instanceUrl = process.env.SF_INSTANCE_URL || 'https://emtg.my.salesforce.com';
+  if (!accessToken) throw new Error('SF_ACCESS_TOKEN env var not set');
+  return { accessToken, instanceUrl };
 }
 
 // ─── Salesforce Query Helper ──────────────────────────────────────────────────
@@ -78,7 +59,7 @@ async function sfQuery(soql) {
     return res.data.records || [];
   } catch (err) {
     if (err.response?.status === 401) {
-      sfAccessToken = null; // force re-auth on next call
+      console.error('[SF] Token expired — run: sf org display --target-org emtg --json and update SF_ACCESS_TOKEN in Railway');
     }
     throw err;
   }
@@ -287,12 +268,17 @@ app.post('/webhook/dialpad', async (req, res) => {
 
   const externalPhone = normalizePhone(payload.external_number);
   const internalPhone = normalizePhone(payload.internal_number);
+  const loEmail = payload.target?.email;
 
-  console.log(`[Webhook] Connected call — ext=${externalPhone} int=${internalPhone}`);
+  console.log(`[Webhook] Connected call — ext=${externalPhone} int=${internalPhone} lo=${loEmail}`);
+
+  // Skip entry-point legs (no LO email means it's a call center routing leg, not an answered call)
+  if (!loEmail) {
+    console.log('[Webhook] Skipping — no LO email (entry point leg, not operator leg)');
+    return res.status(200).json({ skipped: true, reason: 'no LO email' });
+  }
 
   try {
-    const loEmail = payload.target?.email;
-    console.log(`[Webhook] Loan officer email from Dialpad: ${loEmail}`);
 
     // Look up borrower by phone AND loan officer by email concurrently
     console.log(`[SF] Starting lookup — phone: ${externalPhone}, LO: ${loEmail}`);
