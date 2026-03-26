@@ -1,0 +1,19 @@
+{
+  "name": "dialpad-sf-webhook",
+  "version": "1.0.0",
+  "description": "Dialpad connected-call webhook → Salesforce borrower lookup + Task logging",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "querystring": "^0.2.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
