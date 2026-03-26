@@ -233,12 +233,16 @@ function decodeDialpadPayload(req) {
 // ─── Main Webhook Route ───────────────────────────────────────────────────────
 
 app.post('/webhook/dialpad', async (req, res) => {
+  console.log('[Webhook] Raw body type:', typeof req.body);
+  console.log('[Webhook] Raw body preview:', JSON.stringify(req.body)?.slice(0, 300));
+
   const payload = decodeDialpadPayload(req);
 
   if (!payload) {
     return res.status(401).json({ error: 'Invalid or unverified payload' });
   }
 
+  console.log('[Webhook] Decoded payload keys:', Object.keys(payload));
   console.log(`[Webhook] Event: state=${payload.state} call_id=${payload.call_id} dir=${payload.direction}`);
 
   // Only act on "connected" — this is the "phone picked up" moment
