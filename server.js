@@ -20,8 +20,23 @@ const axios = require('axios');
 const qs = require('querystring');
 
 const app = express();
-app.use(express.json());
-app.use(express.text({ type: 'text/plain' }));
+
+// Capture raw body for JWT verification — must come before any other body parser
+app.use((req, res, next) => {
+  let data = '';
+  req.setEncoding('utf8');
+  req.on('data', chunk => { data += chunk; });
+  req.on('end', () => {
+    req.rawBody = data;
+    // Also try to parse as JSON for plain JSON payloads
+    try {
+      req.body = JSON.parse(data);
+    } catch (e) {
+      req.body = data; // leave as string if not valid JSON
+    }
+    next();
+  });
+});
 
 // ─── Salesforce Auth ──────────────────────────────────────────────────────────
 
@@ -214,20 +229,37 @@ async function logCallActivity(payload, externalBorrower, sfUser) {
 
 function decodeDialpadPayload(req) {
   const secret = process.env.DIALPAD_WEBHOOK_SECRET;
-  const raw = req.body;
+  const raw = req.rawBody || req.body;
 
-  if (secret && typeof raw === 'string') {
-    // JWT signed payload
+  // Try JWT first if secret is configured
+  if (secret && typeof raw === 'string' && raw.includes('.')) {
     try {
-      return jwt.verify(raw, secret, { algorithms: ['HS256'] });
+      const decoded = jwt.verify(raw, secret, { algorithms: ['HS256'] });
+      console.log('[Webhook] JWT verified successfully');
+      return decoded;
     } catch (err) {
       console.error('[Webhook] JWT verification failed:', err.message);
+      // Fall through to try plain JSON
+    }
+  }
+
+  // Try plain JSON string
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      console.error('[Webhook] Failed to parse body as JSON:', raw.slice(0, 100));
       return null;
     }
   }
 
-  // Plain JSON (no secret configured)
-  return typeof raw === 'object' ? raw : null;
+  // Already parsed object
+  if (typeof raw === 'object' && raw !== null && Object.keys(raw).length > 0) {
+    return raw;
+  }
+
+  console.error('[Webhook] Could not decode payload, raw:', String(raw).slice(0, 200));
+  return null;
 }
 
 // ─── Main Webhook Route ───────────────────────────────────────────────────────
