@@ -42,6 +42,7 @@ app.use((req, res, next) => {
 async function getDialpadUserByEmail(email) {
   if (!email) return null;
   const apiKey = process.env.DIALPAD_API_KEY;
+  console.log('[Dialpad] Using API key prefix:', apiKey ? apiKey.slice(0,8) + '...' : 'MISSING');
   try {
     const res = await axios.get(
       `https://dialpad.com/api/v2/users?email=${encodeURIComponent(email)}`,
@@ -59,8 +60,8 @@ async function fireScreenPop(dialpadUserId, sfLeadUrl) {
   const apiKey = process.env.DIALPAD_API_KEY;
   try {
     const res = await axios.post(
-      `https://dialpad.com/api/v2/screenpop`,
-      { user_id: dialpadUserId, url: sfLeadUrl },
+      `https://dialpad.com/api/v2/users/${dialpadUserId}/screenpop`,
+      { url: sfLeadUrl },
       { headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' } }
     );
     console.log(`[Dialpad] Screen pop fired for user ${dialpadUserId} → ${sfLeadUrl}`);
@@ -363,6 +364,7 @@ app.post('/webhook/dialpad', async (req, res) => {
       // Fire screen pop — opens the Lead record in the LO's browser via Dialpad
       const leadUrl = `https://emtg.lightning.force.com/lightning/r/Lead/${primaryLead.Id}/view`;
       const dialpadUser = await getDialpadUserByEmail(loEmail);
+      console.log('[Dialpad] User found:', JSON.stringify(dialpadUser));
       if (dialpadUser?.id) {
         await fireScreenPop(dialpadUser.id, leadUrl);
       } else {
