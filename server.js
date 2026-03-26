@@ -39,12 +39,34 @@ app.use((req, res, next) => {
 
 // ─── Salesforce Auth ──────────────────────────────────────────────────────────
 
+let sfAccessToken = null;
+let sfInstanceUrl = null;
+let sfTokenExpiry = 0;
+
 async function getSalesforceToken() {
-  // Use static token from env (refreshed via SF CLI when needed)
-  const accessToken = process.env.SF_ACCESS_TOKEN;
-  const instanceUrl = process.env.SF_INSTANCE_URL || 'https://emtg.my.salesforce.com';
-  if (!accessToken) throw new Error('SF_ACCESS_TOKEN env var not set');
-  return { accessToken, instanceUrl };
+  // Return cached token if still valid (cache for 55 min)
+  if (sfAccessToken && Date.now() < sfTokenExpiry) {
+    return { accessToken: sfAccessToken, instanceUrl: sfInstanceUrl };
+  }
+
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: process.env.SF_CLIENT_ID,
+    client_secret: process.env.SF_CLIENT_SECRET,
+  });
+
+  const loginUrl = process.env.SF_LOGIN_URL || 'https://emtg.my.salesforce.com';
+  const res = await axios.post(
+    `${loginUrl}/services/oauth2/token`,
+    params.toString(),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+  );
+
+  sfAccessToken = res.data.access_token;
+  sfInstanceUrl = res.data.instance_url;
+  sfTokenExpiry = Date.now() + (55 * 60 * 1000); // cache 55 minutes
+  console.log('[SF] Token refreshed via client credentials. Instance:', sfInstanceUrl);
+  return { accessToken: sfAccessToken, instanceUrl: sfInstanceUrl };
 }
 
 // ─── Salesforce Query Helper ──────────────────────────────────────────────────
@@ -59,7 +81,9 @@ async function sfQuery(soql) {
     return res.data.records || [];
   } catch (err) {
     if (err.response?.status === 401) {
-      console.error('[SF] Token expired — run: sf org display --target-org emtg --json and update SF_ACCESS_TOKEN in Railway');
+      console.error('[SF] Token expired — clearing cache to force re-auth on next call');
+      sfAccessToken = null;
+      sfTokenExpiry = 0;
     }
     throw err;
   }
