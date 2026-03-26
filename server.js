@@ -104,25 +104,54 @@ async function findBorrowersByPhone(phone10) {
   ].map(v => `'${v}'`).join(',');
 
   const [contacts, leads] = await Promise.all([
-    sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, AccountId
+    sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, AccountId, CreatedDate
              FROM Contact
              WHERE Phone IN (${phoneVariants})
                 OR MobilePhone IN (${phoneVariants})
-             LIMIT 10`),
-    sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, Status
+             ORDER BY CreatedDate DESC
+             LIMIT 1`),
+    sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, Status, CreatedDate
              FROM Lead
              WHERE Phone IN (${phoneVariants})
                 OR MobilePhone IN (${phoneVariants})
              AND IsConverted = false
-             LIMIT 10`),
+             ORDER BY CreatedDate DESC
+             LIMIT 1`),
   ]);
 
   return { contacts, leads };
 }
 
+// ─── Look up SF User by email (the loan officer who picked up) ───────────────
+
+async function findSFUserByEmail(email) {
+  if (!email) return null;
+  const records = await sfQuery(
+    `SELECT Id, Name, Email FROM User WHERE Email = '${email}' AND IsActive = true LIMIT 1`
+  );
+  return records[0] || null;
+}
+
+// ─── Reassign Lead or Contact owner ──────────────────────────────────────────
+
+async function reassignOwner(recordId, isLead, newOwnerId) {
+  const { accessToken, instanceUrl } = await getSalesforceToken();
+  const sobject = isLead ? 'Lead' : 'Contact';
+  try {
+    await axios.patch(
+      `${instanceUrl}/services/data/v59.0/sobjects/${sobject}/${recordId}`,
+      { OwnerId: newOwnerId },
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`[SF] ${sobject} ${recordId} reassigned to User ${newOwnerId}`);
+  } catch (err) {
+    console.error(`[SF] Reassign failed for ${sobject} ${recordId}:`, err.response?.data || err.message);
+  }
+}
+
 // ─── Build & post activity Task in Salesforce ────────────────────────────────
 
-async function logCallActivity(payload, internalBorrower, externalBorrower) {
+async function logCallActivity(payload, externalBorrower, sfUser) {
   const { direction, external_number, internal_number, call_id, target, contact } = payload;
 
   const description = [
@@ -131,19 +160,21 @@ async function logCallActivity(payload, internalBorrower, externalBorrower) {
     `Call ID      : ${call_id}`,
     `Direction    : ${direction}`,
     ``,
-    `─── Agent (Internal) ─────────`,
+    `─── Loan Officer (Picked Up) ─`,
     `Name         : ${target?.name || 'Unknown'}`,
     `Email        : ${target?.email || '—'}`,
     `Number       : ${internal_number}`,
+    `SF User ID   : ${sfUser?.Id || 'Not found'}`,
     ``,
-    `─── Contact (External) ───────`,
+    `─── Borrower (External) ──────`,
     `Name         : ${contact?.name || 'Unknown'}`,
     `Email        : ${contact?.email || '—'}`,
     `Number       : ${external_number}`,
     ``,
     `─── SF Records Found ─────────`,
-    `Internal     : ${internalBorrower.contacts.length} contacts, ${internalBorrower.leads.length} leads`,
-    `External     : ${externalBorrower.contacts.length} contacts, ${externalBorrower.leads.length} leads`,
+    `Contacts     : ${externalBorrower.contacts.length}`,
+    `Leads        : ${externalBorrower.leads.length}`,
+    `Owner Reassigned: ${sfUser ? 'Yes → ' + (target?.name || target?.email) : 'No (LO not found in SF)'}`,
   ].join('\n');
 
   // Attach task to first matched Contact or Lead from external (borrower) side
@@ -157,13 +188,17 @@ async function logCallActivity(payload, internalBorrower, externalBorrower) {
     ActivityDate: new Date().toISOString().slice(0, 10),
     Description: description,
     CallType: direction === 'inbound' ? 'Inbound' : 'Outbound',
-    CallDurationInSeconds: 0, // call just connected — update on hangup if desired
+    CallDurationInSeconds: 0,
     TaskSubtype: 'Call',
   };
 
   if (primaryRecord?.Id) {
-    const isLead = 'Status' in primaryRecord;
-    taskBase[isLead ? 'WhoId' : 'WhoId'] = primaryRecord.Id;
+    taskBase.WhoId = primaryRecord.Id;
+  }
+
+  // Assign task to the LO who picked up (not the API user)
+  if (sfUser?.Id) {
+    taskBase.OwnerId = sfUser.Id;
   }
 
   try {
@@ -217,31 +252,43 @@ app.post('/webhook/dialpad', async (req, res) => {
   console.log(`[Webhook] Connected call — ext=${externalPhone} int=${internalPhone}`);
 
   try {
-    // Look up both sides concurrently
-    const [externalBorrower, internalBorrower] = await Promise.all([
+    const loEmail = payload.target?.email;
+    console.log(`[Webhook] Loan officer email from Dialpad: ${loEmail}`);
+
+    // Look up borrower by phone AND loan officer by email concurrently
+    const [externalBorrower, sfUser] = await Promise.all([
       findBorrowersByPhone(externalPhone),
-      findBorrowersByPhone(internalPhone),
+      findSFUserByEmail(loEmail),
     ]);
 
-    console.log(`[SF] External matches: ${externalBorrower.contacts.length} contacts, ${externalBorrower.leads.length} leads`);
-    console.log(`[SF] Internal matches: ${internalBorrower.contacts.length} contacts, ${internalBorrower.leads.length} leads`);
+    console.log(`[SF] Borrower matches: ${externalBorrower.contacts.length} contacts, ${externalBorrower.leads.length} leads`);
+    console.log(`[SF] Loan officer SF User: ${sfUser ? sfUser.Name + ' (' + sfUser.Id + ')' : 'NOT FOUND'}`);
 
-    // Log activity to Salesforce
-    await logCallActivity(payload, internalBorrower, externalBorrower);
+    // Reassign only the single most recently created Lead
+    if (sfUser) {
+      const primaryLead = externalBorrower.leads[0];
+      if (primaryLead) {
+        await reassignOwner(primaryLead.Id, true, sfUser.Id);
+      } else {
+        console.log(`[SF] No matching Lead found for ${externalPhone}`);
+      }
+    } else {
+      console.log(`[SF] Skipping reassignment — LO email ${loEmail} not found in SF`);
+    }
+
+    // Log call activity Task
+    await logCallActivity(payload, externalBorrower, sfUser);
 
     return res.status(200).json({
       ok: true,
       call_id: payload.call_id,
-      external: {
+      loan_officer: sfUser ? { id: sfUser.Id, name: sfUser.Name } : null,
+      borrower: {
         phone: externalPhone,
         contacts: externalBorrower.contacts.map(c => ({ id: c.Id, name: c.Name })),
         leads: externalBorrower.leads.map(l => ({ id: l.Id, name: l.Name })),
       },
-      internal: {
-        phone: internalPhone,
-        contacts: internalBorrower.contacts.map(c => ({ id: c.Id, name: c.Name })),
-        leads: internalBorrower.leads.map(l => ({ id: l.Id, name: l.Name })),
-      },
+      reassigned: !!sfUser && (externalBorrower.contacts.length + externalBorrower.leads.length) > 0,
     });
   } catch (err) {
     console.error('[Error]', err.message);
