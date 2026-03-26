@@ -61,7 +61,7 @@ async function fireScreenPop(dialpadUserId, sfLeadUrl) {
   try {
     const res = await axios.post(
       `https://dialpad.com/api/v2/users/${dialpadUserId}/screenpop`,
-      { url: sfLeadUrl },
+      { screen_pop_uri: sfLeadUrl },
       { headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' } }
     );
     console.log(`[Dialpad] Screen pop fired for user ${dialpadUserId} → ${sfLeadUrl}`);
