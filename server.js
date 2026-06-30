@@ -198,8 +198,29 @@ async function reassignOwner(recordId, isLead, newOwnerId) {
       { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
     );
     console.log(`[SF] ${sobject} ${recordId} reassigned to User ${newOwnerId}`);
+    return true;
   } catch (err) {
     console.error(`[SF] Reassign failed for ${sobject} ${recordId}:`, err.response?.data || err.message);
+    return false;
+  }
+}
+
+// ─── Grant the answering LO edit access to ONE specific Lead (per-lead sharing) ──
+// Replaces the old blanket "share every Talk IT Pro lead with everyone" rule: the LO
+// only ever gets access to the lead they were actually called about. Owner already has
+// access, so this is only used when the LO is NOT the owner (reassignment skipped/failed,
+// or the lead belongs to another LO). Duplicate/owner shares fail harmlessly.
+async function grantLeadAccess(leadId, userId) {
+  const { accessToken, instanceUrl } = await getSalesforceToken();
+  try {
+    await axios.post(
+      `${instanceUrl}/services/data/v59.0/sobjects/LeadShare`,
+      { LeadId: leadId, UserOrGroupId: userId, LeadAccessLevel: 'Edit', RowCause: 'Manual' },
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`[SF] Granted Edit access on Lead ${leadId} to User ${userId}`);
+  } catch (err) {
+    console.warn(`[SF] grantLeadAccess note for ${leadId}:`, err.response?.data || err.message);
   }
 }
 
@@ -354,11 +375,23 @@ app.post('/webhook/dialpad', async (req, res) => {
     const primaryLead = externalBorrower.leads[0];
 
     if (sfUser && primaryLead) {
-      if (primaryLead.OwnerId !== DEFAULT_OWNER_ID) {
-        console.log(`[SF] Skipping reassignment — Lead ${primaryLead.Id} already owned by ${primaryLead.OwnerId}`);
-      } else {
+      // Ensure the answering LO can access THIS lead (no blanket pool sharing anymore):
+      //  - pool lead (Talk IT Pro)  -> reassign to the LO (they become owner)
+      //  - reassignment failed       -> fall back to a per-lead Edit share
+      //  - owned by another LO       -> per-lead Edit share so they can work the call
+      let needShare = false;
+      if (primaryLead.OwnerId === DEFAULT_OWNER_ID) {
         console.log(`[SF] Reassigning Lead ${primaryLead.Id} to ${sfUser.Name}`);
-        await reassignOwner(primaryLead.Id, true, sfUser.Id);
+        const ok = await reassignOwner(primaryLead.Id, true, sfUser.Id);
+        needShare = !ok;
+      } else if (primaryLead.OwnerId !== sfUser.Id) {
+        console.log(`[SF] Lead ${primaryLead.Id} owned by ${primaryLead.OwnerId} (not pool) — granting per-lead access to ${sfUser.Name}`);
+        needShare = true;
+      } else {
+        console.log(`[SF] Lead ${primaryLead.Id} already owned by answering LO — no sharing needed`);
+      }
+      if (needShare) {
+        await grantLeadAccess(primaryLead.Id, sfUser.Id);
       }
 
       // Fire screen pop — opens the Lead record in the LO's browser via Dialpad

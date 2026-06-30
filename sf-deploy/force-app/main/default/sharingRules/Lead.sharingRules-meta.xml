@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Talk_IT_Pro_Leads_Public_Read removed: it shared ALL Talk IT Pro pool leads (Edit) with all
+     internal users, flooding loan officers' list views with ~20k old pool leads. Access is now
+     granted per-lead by the Dialpad webhook (owner reassignment + a LeadShare for the called lead).
+     The org-side deletion is performed via ../../../../destructive/destructiveChanges.xml. -->
+<SharingRules xmlns="http://soap.sforce.com/2006/04/metadata"/>

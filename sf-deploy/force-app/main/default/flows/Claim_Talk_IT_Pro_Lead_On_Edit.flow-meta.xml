@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>59.0</apiVersion>
+    <assignments>
+        <name>Set_Owner_To_Current_User</name>
+        <label>Set Owner To Current User</label>
+        <locationX>176</locationX>
+        <locationY>276</locationY>
+        <assignmentItems>
+            <assignToReference>$Record.OwnerId</assignToReference>
+            <operator>Assign</operator>
+            <value>
+                <elementReference>$User.Id</elementReference>
+            </value>
+        </assignmentItems>
+    </assignments>
+    <description>When an internal user edits a Lead still owned by Talk IT Pro (005Hr00000IS9pcIAD), claim it by setting the owner to the editing user. Before-save, update only, so the call-answer webhook reassignment and webform pool assignment are unaffected.</description>
+    <environments>Default</environments>
+    <interviewLabel>Claim Talk IT Pro Lead On Edit {!$Flow.CurrentDateTime}</interviewLabel>
+    <label>Claim Talk IT Pro Lead On Edit</label>
+    <processType>AutoLaunchedFlow</processType>
+    <start>
+        <locationX>50</locationX>
+        <locationY>0</locationY>
+        <connector>
+            <targetReference>Set_Owner_To_Current_User</targetReference>
+        </connector>
+        <filterLogic>and</filterLogic>
+        <filters>
+            <field>OwnerId</field>
+            <operator>EqualTo</operator>
+            <value>
+                <stringValue>005Hr00000IS9pcIAD</stringValue>
+            </value>
+        </filters>
+        <object>Lead</object>
+        <recordTriggerType>Update</recordTriggerType>
+        <triggerType>RecordBeforeSave</triggerType>
+    </start>
+    <status>Draft</status>
+</Flow>

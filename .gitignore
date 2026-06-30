@@ -1,0 +1,10 @@
+# Node
+node_modules/
+
+# Salesforce CLI cache / state
+.sfdx/
+.sf/
+
+# Transient sf deploy / dry-run output (but keep sfdx-project.json)
+sf-deploy/deploy-*.json
+sf-deploy/dryrun*.json
