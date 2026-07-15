@@ -211,11 +211,10 @@ async function reassignOwner(recordId, isLead, newOwnerId) {
   }
 }
 
-// ─── Grant the answering LO edit access to ONE specific Lead (per-lead sharing) ──
-// Replaces the old blanket "share every Talk IT Pro lead with everyone" rule: the LO
-// only ever gets access to the lead they were actually called about. Owner already has
-// access, so this is only used when the LO is NOT the owner (reassignment skipped/failed,
-// or the lead belongs to another LO). Duplicate/owner shares fail harmlessly.
+// ─── Grant the answering LO edit access to ONE specific Lead ─────────────────
+// Fallback only: used when a Talk IT Pro pool lead's reassignment fails, so the LO
+// can still work the call while the lead sits in the pool owner's name. Leads owned
+// by other LOs are never shared. Duplicate/owner shares fail harmlessly.
 async function grantLeadAccess(leadId, userId) {
   const { accessToken, instanceUrl } = await getSalesforceToken();
   try {
@@ -381,23 +380,20 @@ app.post('/webhook/dialpad', async (req, res) => {
     const primaryLead = externalBorrower.leads[0];
 
     if (sfUser && primaryLead) {
-      // Ensure the answering LO can access THIS lead (no blanket pool sharing anymore):
-      //  - pool lead (Talk IT Pro)  -> reassign to the LO (they become owner)
-      //  - reassignment failed       -> fall back to a per-lead Edit share
-      //  - owned by another LO       -> per-lead Edit share so they can work the call
-      let needShare = false;
+      // Access comes from ownership only — the webhook assigns pool leads to whoever
+      // answers. Leads owned by another LO are left alone (no sharing). The one
+      // exception: if a pool lead's reassignment fails, grant a per-lead Edit share
+      // so the LO can still work the call while it sits in Talk IT Pro's name.
       if (primaryLead.OwnerId === DEFAULT_OWNER_ID) {
         console.log(`[SF] Reassigning Lead ${primaryLead.Id} to ${sfUser.Name}`);
         const ok = await reassignOwner(primaryLead.Id, true, sfUser.Id);
-        needShare = !ok;
+        if (!ok) {
+          await grantLeadAccess(primaryLead.Id, sfUser.Id);
+        }
       } else if (primaryLead.OwnerId !== sfUser.Id) {
-        console.log(`[SF] Lead ${primaryLead.Id} owned by ${primaryLead.OwnerId} (not pool) — granting per-lead access to ${sfUser.Name}`);
-        needShare = true;
+        console.log(`[SF] Lead ${primaryLead.Id} owned by ${primaryLead.OwnerId} (not pool) — leaving ownership and access unchanged`);
       } else {
-        console.log(`[SF] Lead ${primaryLead.Id} already owned by answering LO — no sharing needed`);
-      }
-      if (needShare) {
-        await grantLeadAccess(primaryLead.Id, sfUser.Id);
+        console.log(`[SF] Lead ${primaryLead.Id} already owned by answering LO`);
       }
 
       // Fire screen pop — opens the Lead record in the LO's browser via Dialpad
