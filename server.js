@@ -178,10 +178,16 @@ async function findBorrowersByPhone(phone10) {
 
 // ─── Look up SF User by email (the loan officer who picked up) ───────────────
 
+// Dialpad account emails that don't match the SF User email — map Dialpad → SF.
+const DIALPAD_TO_SF_EMAIL = {
+  'navaehy@emtg.com': 'nevaehy@emtg.com', // Nevaeh Younan — Dialpad spells it "navaehy"
+};
+
 async function findSFUserByEmail(email) {
   if (!email) return null;
+  const sfEmail = DIALPAD_TO_SF_EMAIL[email.toLowerCase()] || email;
   const records = await sfQuery(
-    `SELECT Id, Name, Email FROM User WHERE Email = '${email}' AND IsActive = true LIMIT 1`
+    `SELECT Id, Name, Email FROM User WHERE Email = '${sfEmail}' AND IsActive = true LIMIT 1`
   );
   return records[0] || null;
 }
