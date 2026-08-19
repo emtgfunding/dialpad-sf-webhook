@@ -147,33 +147,65 @@ function normalizePhone(e164) {
 
 // ─── Look up Contacts / Leads by phone ───────────────────────────────────────
 
-async function findBorrowersByPhone(phone10) {
-  if (!phone10) return { contacts: [], leads: [] };
+const LEAD_FIELDS = `Id, Name, Phone, MobilePhone, Email, Status, CreatedDate, OwnerId,
+                     Dialer_Agent__c, Dialpad_Call_Id__c, Transfer_Answered_At__c`;
 
-  const phoneVariants = [
+function phoneVariantList(phone10) {
+  return [
     phone10,
     `(${phone10.slice(0,3)}) ${phone10.slice(3,6)}-${phone10.slice(6)}`,
     `${phone10.slice(0,3)}-${phone10.slice(3,6)}-${phone10.slice(6)}`,
     `+1${phone10}`,
   ].map(v => `'${v}'`).join(',');
+}
 
-  const [contacts, leads] = await Promise.all([
+async function findLeadsByPhone(phone10) {
+  if (!phone10) return [];
+  const phoneVariants = phoneVariantList(phone10);
+  return sfQuery(`SELECT ${LEAD_FIELDS}
+                  FROM Lead
+                  WHERE (Phone IN (${phoneVariants})
+                     OR MobilePhone IN (${phoneVariants}))
+                  AND IsConverted = false
+                  ORDER BY CreatedDate DESC
+                  LIMIT 10`);
+}
+
+async function findLeadByCallId(masterCallId) {
+  if (!masterCallId) return null;
+  const records = await sfQuery(`SELECT ${LEAD_FIELDS}
+                                 FROM Lead
+                                 WHERE Dialpad_Call_Id__c = '${masterCallId}'
+                                 AND IsConverted = false
+                                 ORDER BY CreatedDate DESC
+                                 LIMIT 1`);
+  return records[0] || null;
+}
+
+async function findBorrowersByPhone(phone10, masterCallId) {
+  if (!phone10) return { contacts: [], leads: [] };
+
+  const phoneVariants = phoneVariantList(phone10);
+
+  const [contacts, boundLead, phoneLeads] = await Promise.all([
     sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, AccountId, CreatedDate
              FROM Contact
              WHERE Phone IN (${phoneVariants})
                 OR MobilePhone IN (${phoneVariants})
              ORDER BY CreatedDate DESC
              LIMIT 1`),
-    sfQuery(`SELECT Id, Name, Phone, MobilePhone, Email, Status, CreatedDate, OwnerId
-             FROM Lead
-             WHERE (Phone IN (${phoneVariants})
-                OR MobilePhone IN (${phoneVariants}))
-             AND IsConverted = false
-             ORDER BY CreatedDate DESC
-             LIMIT 1`),
+    findLeadByCallId(masterCallId),
+    findLeadsByPhone(phone10),
   ]);
 
-  return { contacts, leads };
+  // The lead bound to this exact call wins; otherwise prefer the pool-owned copy
+  // over vendor duplicates, then any transfer lead, then simply the newest.
+  const pick = boundLead
+    || phoneLeads.find(l => l.OwnerId === POOL_OWNER_ID)
+    || phoneLeads.find(l => l.Dialer_Agent__c)
+    || phoneLeads[0];
+
+  return { contacts, leads: pick ? [pick] : [] };
 }
 
 // ─── Look up SF User by email (the loan officer who picked up) ───────────────
@@ -192,21 +224,63 @@ async function findSFUserByEmail(email) {
   return records[0] || null;
 }
 
+// ─── Transfer assignment tuning ──────────────────────────────────────────────
+
+const POOL_OWNER_ID = '005Hr00000IS9pcIAD'; // Talk IT Pro pool user
+
+// A retransfer (telemarketer re-bridges after a drop) is a NEW call id arriving
+// shortly after the webhook assigned the lead. Within this window the new
+// answerer takes the lead; outside it, owners are never touched.
+const RETRANSFER_WINDOW_MIN = parseInt(process.env.RETRANSFER_WINDOW_MIN || '30', 10);
+
+// First answered leg of a call wins — later legs of the SAME call never
+// re-assign (kills the same-second double-assign race). In-memory is enough:
+// the durable stamp on the lead covers restarts.
+const claimedCalls = new Map(); // masterCallId -> { userId, ts }
+function claimCall(masterCallId, userId) {
+  const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+  for (const [k, v] of claimedCalls) if (v.ts < cutoff) claimedCalls.delete(k);
+  claimedCalls.set(masterCallId, { userId, ts: Date.now() });
+}
+
+function getMasterCallId(payload) {
+  const id = payload.entry_point_call_id || payload.master_call_id || payload.call_id;
+  return id == null ? null : String(id);
+}
+
 // ─── Reassign Lead or Contact owner ──────────────────────────────────────────
 
-async function reassignOwner(recordId, isLead, newOwnerId) {
+async function reassignOwner(recordId, isLead, newOwnerId, extraFields) {
   const { accessToken, instanceUrl } = await getSalesforceToken();
   const sobject = isLead ? 'Lead' : 'Contact';
   try {
     await axios.patch(
       `${instanceUrl}/services/data/v59.0/sobjects/${sobject}/${recordId}`,
-      { OwnerId: newOwnerId },
+      { OwnerId: newOwnerId, ...(extraFields || {}) },
       { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
     );
     console.log(`[SF] ${sobject} ${recordId} reassigned to User ${newOwnerId}`);
     return true;
   } catch (err) {
     console.error(`[SF] Reassign failed for ${sobject} ${recordId}:`, err.response?.data || err.message);
+    return false;
+  }
+}
+
+// ─── Stamp call-binding fields on a Lead (no owner change) ───────────────────
+
+async function stampLead(leadId, fields) {
+  const { accessToken, instanceUrl } = await getSalesforceToken();
+  try {
+    await axios.patch(
+      `${instanceUrl}/services/data/v59.0/sobjects/Lead/${leadId}`,
+      fields,
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
+    );
+    console.log(`[SF] Lead ${leadId} stamped:`, JSON.stringify(fields));
+    return true;
+  } catch (err) {
+    console.error(`[SF] Stamp failed for Lead ${leadId}:`, err.response?.data || err.message);
     return false;
   }
 }
@@ -231,7 +305,7 @@ async function grantLeadAccess(leadId, userId) {
 
 // ─── Build & post activity Task in Salesforce ────────────────────────────────
 
-async function logCallActivity(payload, externalBorrower, sfUser) {
+async function logCallActivity(payload, externalBorrower, sfUser, assignAction) {
   const { direction, external_number, internal_number, call_id, target, contact } = payload;
 
   const description = [
@@ -254,7 +328,7 @@ async function logCallActivity(payload, externalBorrower, sfUser) {
     `─── SF Records Found ─────────`,
     `Contacts     : ${externalBorrower.contacts.length}`,
     `Leads        : ${externalBorrower.leads.length}`,
-    `Owner Reassigned: ${sfUser ? 'Yes → ' + (target?.name || target?.email) : 'No (LO not found in SF)'}`,
+    `Assignment   : ${assignAction || 'none'}`,
   ].join('\n');
 
   // Attach task to first matched Contact or Lead from external (borrower) side
@@ -353,21 +427,36 @@ app.post('/webhook/dialpad', async (req, res) => {
   const externalPhone = normalizePhone(payload.external_number);
   const internalPhone = normalizePhone(payload.internal_number);
   const loEmail = payload.target?.email;
+  const masterCallId = getMasterCallId(payload);
 
-  console.log(`[Webhook] Connected call — ext=${externalPhone} int=${internalPhone} lo=${loEmail}`);
+  console.log(`[Webhook] Connected call — ext=${externalPhone} int=${internalPhone} lo=${loEmail} master=${masterCallId}`);
 
-  // Skip entry-point legs (no LO email means it's a call center routing leg, not an answered call)
+  // Entry-point leg (call hit the department line, no LO yet): bind this call to
+  // its pool-owned transfer lead so the answered leg finds the EXACT record even
+  // if vendor duplicates arrive later. No ownership change, no task.
   if (!loEmail) {
-    console.log('[Webhook] Skipping — no LO email (entry point leg, not operator leg)');
-    return res.status(200).json({ skipped: true, reason: 'no LO email' });
+    try {
+      if (externalPhone && masterCallId) {
+        const leads = await findLeadsByPhone(externalPhone);
+        const poolLead = leads.find(l => l.OwnerId === POOL_OWNER_ID);
+        if (poolLead) {
+          await stampLead(poolLead.Id, { Dialpad_Call_Id__c: masterCallId });
+          console.log(`[Webhook] Entry leg — bound call ${masterCallId} to Lead ${poolLead.Id}`);
+          return res.status(200).json({ skipped: true, reason: 'entry point leg', bound: poolLead.Id });
+        }
+      }
+    } catch (err) {
+      console.error('[Webhook] Entry-leg bind failed:', err.response?.data || err.message);
+    }
+    return res.status(200).json({ skipped: true, reason: 'entry point leg', bound: null });
   }
 
   try {
 
-    // Look up borrower by phone AND loan officer by email concurrently
-    console.log(`[SF] Starting lookup — phone: ${externalPhone}, LO: ${loEmail}`);
+    // Look up borrower by phone/call-id AND loan officer by email concurrently
+    console.log(`[SF] Starting lookup — phone: ${externalPhone}, LO: ${loEmail}, call: ${masterCallId}`);
     const [externalBorrower, sfUser] = await Promise.all([
-      findBorrowersByPhone(externalPhone),
+      findBorrowersByPhone(externalPhone, masterCallId),
       findSFUserByEmail(loEmail),
     ]);
 
@@ -375,25 +464,61 @@ app.post('/webhook/dialpad', async (req, res) => {
     console.log(`[SF] Lead IDs found: ${externalBorrower.leads.map(l => l.Id).join(', ') || 'none'}`);
     console.log(`[SF] Loan officer SF User: ${sfUser ? sfUser.Name + ' (' + sfUser.Id + ')' : 'NOT FOUND — email: ' + loEmail}`);
 
-    // Only reassign if current owner is the default pool owner
-    const DEFAULT_OWNER_ID = '005Hr00000IS9pcIAD';
     const primaryLead = externalBorrower.leads[0];
+    let assignAction = 'none';
 
     if (sfUser && primaryLead) {
-      // Access comes from ownership only — the webhook assigns pool leads to whoever
-      // answers. Leads owned by another LO are left alone (no sharing). The one
-      // exception: if a pool lead's reassignment fails, grant a per-lead Edit share
-      // so the LO can still work the call while it sits in Talk IT Pro's name.
-      if (primaryLead.OwnerId === DEFAULT_OWNER_ID) {
+      // Assignment rules:
+      //  - pool-owned            → assign to the answerer (stamp call id + answered-at)
+      //  - already the answerer  → refresh stamps only
+      //  - owned by another LO   → reassign ONLY for a genuine retransfer: a DIFFERENT
+      //    call id arriving within RETRANSFER_WINDOW_MIN of the webhook's own last
+      //    assignment. A later leg of the SAME call never re-assigns, and leads the
+      //    webhook didn't assign (or assigned long ago) are never touched.
+      const claimed = claimedCalls.get(masterCallId);
+      const answeredAtMs = primaryLead.Transfer_Answered_At__c ? Date.parse(primaryLead.Transfer_Answered_At__c) : null;
+      const withinRetransferWindow = answeredAtMs !== null
+        && (Date.now() - answeredAtMs) <= RETRANSFER_WINDOW_MIN * 60 * 1000;
+      const isSameCall = !!masterCallId && primaryLead.Dialpad_Call_Id__c === masterCallId;
+
+      if (primaryLead.OwnerId === sfUser.Id) {
+        // Bind the call id for same-call dedupe, but do NOT touch
+        // Transfer_Answered_At__c — that field marks webhook ASSIGNMENTS only,
+        // so an owner taking a routine call never re-opens the retransfer window.
+        assignAction = 'already-owner';
+        if (masterCallId && primaryLead.Dialpad_Call_Id__c !== masterCallId) {
+          await stampLead(primaryLead.Id, { Dialpad_Call_Id__c: masterCallId });
+        }
+      } else if (claimed && claimed.userId !== sfUser.Id) {
+        assignAction = 'skip-same-call-already-claimed';
+        console.log(`[SF] Call ${masterCallId} already claimed by User ${claimed.userId} — not re-assigning Lead ${primaryLead.Id}`);
+      } else if (primaryLead.OwnerId === POOL_OWNER_ID) {
+        assignAction = 'assigned';
+        claimCall(masterCallId, sfUser.Id);
         console.log(`[SF] Reassigning Lead ${primaryLead.Id} to ${sfUser.Name}`);
-        const ok = await reassignOwner(primaryLead.Id, true, sfUser.Id);
+        const ok = await reassignOwner(primaryLead.Id, true, sfUser.Id, {
+          Dialpad_Call_Id__c: masterCallId,
+          Transfer_Answered_At__c: new Date().toISOString(),
+        });
         if (!ok) {
+          assignAction = 'assign-failed-shared';
           await grantLeadAccess(primaryLead.Id, sfUser.Id);
         }
-      } else if (primaryLead.OwnerId !== sfUser.Id) {
-        console.log(`[SF] Lead ${primaryLead.Id} owned by ${primaryLead.OwnerId} (not pool) — leaving ownership and access unchanged`);
+      } else if (isSameCall) {
+        assignAction = 'skip-same-call-already-claimed';
+        console.log(`[SF] Lead ${primaryLead.Id} already claimed via call ${masterCallId} — leaving owner unchanged`);
+      } else if (withinRetransferWindow) {
+        assignAction = 'reassigned-retransfer';
+        claimCall(masterCallId, sfUser.Id);
+        console.log(`[SF] Retransfer — Lead ${primaryLead.Id} moves from ${primaryLead.OwnerId} to ${sfUser.Name} (new call ${masterCallId} within ${RETRANSFER_WINDOW_MIN} min)`);
+        const ok = await reassignOwner(primaryLead.Id, true, sfUser.Id, {
+          Dialpad_Call_Id__c: masterCallId,
+          Transfer_Answered_At__c: new Date().toISOString(),
+        });
+        if (!ok) assignAction = 'retransfer-reassign-failed';
       } else {
-        console.log(`[SF] Lead ${primaryLead.Id} already owned by answering LO`);
+        assignAction = 'left-other-owner';
+        console.log(`[SF] Lead ${primaryLead.Id} owned by ${primaryLead.OwnerId} (not pool, no recent webhook assignment) — leaving ownership unchanged`);
       }
 
       // Fire screen pop — opens the Lead record in the LO's browser via Dialpad
@@ -412,18 +537,19 @@ app.post('/webhook/dialpad', async (req, res) => {
     }
 
     // Log call activity Task
-    await logCallActivity(payload, externalBorrower, sfUser);
+    await logCallActivity(payload, externalBorrower, sfUser, assignAction);
 
     return res.status(200).json({
       ok: true,
       call_id: payload.call_id,
+      master_call_id: masterCallId,
       loan_officer: sfUser ? { id: sfUser.Id, name: sfUser.Name } : null,
       borrower: {
         phone: externalPhone,
         contacts: externalBorrower.contacts.map(c => ({ id: c.Id, name: c.Name })),
         leads: externalBorrower.leads.map(l => ({ id: l.Id, name: l.Name })),
       },
-      reassigned: !!sfUser && (externalBorrower.contacts.length + externalBorrower.leads.length) > 0,
+      assignment: assignAction,
     });
   } catch (err) {
     const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
