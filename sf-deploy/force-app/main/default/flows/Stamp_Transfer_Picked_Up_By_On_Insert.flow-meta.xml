@@ -29,7 +29,7 @@
     NOT(ISBLANK({!$Record.Dialer_Agent__c})),
     ISBLANK({!$Record.TransferPickedUpBy__c}),
     NOT(ISBLANK({!$Record.OwnerId})),
-    {!$Record.OwnerId} &lt;&gt; "005Hr00000IS9pcIAD",
+    LEFT({!$Record.OwnerId} &amp; "", 15) &lt;&gt; "005Hr00000IS9pc",
     LEFT({!$Record.OwnerId} &amp; "", 3) = "005"
 )</filterFormula>
         <object>Lead</object>
