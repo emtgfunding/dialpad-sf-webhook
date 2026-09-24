@@ -233,6 +233,23 @@ const POOL_OWNER_ID = '005Hr00000IS9pcIAD'; // Talk IT Pro pool user
 // answerer takes the lead; outside it, owners are never touched.
 const RETRANSFER_WINDOW_MIN = parseInt(process.env.RETRANSFER_WINDOW_MIN || '30', 10);
 
+// The phone-match fallback has no age limit, so a call from a borrower days later can
+// match a stale pool lead and assign it. That assignment is not this lead's transfer
+// being answered, and recording it as one credits people who never took a transfer
+// (e.g. a credit-pull processor returning a call). Ownership behaviour is unchanged —
+// only the permanent attribution stamp is withheld.
+const PICKUP_ATTRIBUTION_MAX_MIN = parseInt(process.env.PICKUP_ATTRIBUTION_MAX_MIN || '120', 10);
+
+function pickupAttribution(lead, userId) {
+  if (!lead.CreatedDate) return {};
+  const ageMin = (Date.now() - Date.parse(lead.CreatedDate)) / 60000;
+  if (ageMin > PICKUP_ATTRIBUTION_MAX_MIN) {
+    console.log(`[SF] Lead ${lead.Id} is ${Math.round(ageMin)} min old — assigning owner but NOT recording a transfer pickup (stale phone match)`);
+    return {};
+  }
+  return { TransferPickedUpBy__c: userId };
+}
+
 // First answered leg of a call wins — later legs of the SAME call never
 // re-assign (kills the same-second double-assign race). In-memory is enough:
 // the durable stamp on the lead covers restarts.
@@ -499,6 +516,10 @@ app.post('/webhook/dialpad', async (req, res) => {
         const ok = await reassignOwner(primaryLead.Id, true, sfUser.Id, {
           Dialpad_Call_Id__c: masterCallId,
           Transfer_Answered_At__c: new Date().toISOString(),
+          // Permanent attribution: who actually answered this transfer. OwnerId keeps
+          // moving afterwards (redistributions, merges, offboarding book moves), so
+          // reporting on Owner credits the wrong person. This field never moves.
+          ...pickupAttribution(primaryLead, sfUser.Id),
         });
         if (!ok) {
           assignAction = 'assign-failed-shared';
@@ -514,6 +535,8 @@ app.post('/webhook/dialpad', async (req, res) => {
         const ok = await reassignOwner(primaryLead.Id, true, sfUser.Id, {
           Dialpad_Call_Id__c: masterCallId,
           Transfer_Answered_At__c: new Date().toISOString(),
+          // On a retransfer the NEW answerer is the one who took the transfer.
+          ...pickupAttribution(primaryLead, sfUser.Id),
         });
         if (!ok) assignAction = 'retransfer-reassign-failed';
       } else {
